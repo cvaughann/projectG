@@ -1,105 +1,145 @@
 #!/usr/bin/env python3
-"""
-Script: map_triplex_to_genome.py
-
-Reads a triplex motif file (Excel) with cDNA coordinates for Hoogsteen, Crick, and Watson strands,
-merges with transcript metadata (ENST IDs, display names), and maps each
-cDNA interval back to genomic coordinates via the Ensembl REST API.
-
-Outputs a CSV with original motifs and their genomic mappings.
-"""
+import os
+import json
 import pandas as pd
-import requests
+import httpx
+import asyncio
 import time
-import threading
-from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # === CONFIGURATION ===
-TRIPLEX_FILE  = r"C:\Users\caleb\OneDrive\Brown\ProjectG\with gap lncRNA.xlsx"
-METADATA_FILE = r"C:\Users\caleb\OneDrive\Brown\ProjectG\lncRNA_transcript_lookup.xlsx"
-OUTPUT_FILE   = "triplex_genomic_mappings.csv"
+TRIPLEX_FILE  = r"C:\Users\caleb\OneDrive\Brown\ProjectG\no gap lncRNA.xlsx"
+METADATA_FILE = r"C:\Users\caleb\OneDrive\Brown\ProjectG\nogap_lncRNA_transcript_lookup.xlsx"
+OUTPUT_FILE   = "nogap_triplex_genomic_mappings.xlsx"
+CACHE_FILE    = "motif_cache.json"
 
-# === Read input files ===
-df_trip = pd.read_excel(TRIPLEX_FILE)
-df_meta = pd.read_excel(METADATA_FILE)
+SERVER = "https://rest.ensembl.org"
+HEADERS = {
+    "Accept": "application/json",
+    "User-Agent": "your.email@example.com"
+}
 
-# Merge on ENST
-df = df_trip.merge(df_meta[['ENST', 'display_name']], on='ENST', how='left')
-missing = df['ENST'].isna().sum()
-if missing > 0:
-    print(f"⚠️ Warning: {missing} triplex rows have no matching ENST ID in metadata.")
+# Concurrency / rate-limiting settings
+CONCURRENCY_LIMIT = 5       # max simultaneous requests
+MAX_RETRIES       = 5       # for exponential backoff
+INITIAL_BACKOFF   = 1.0     # seconds
 
 motifs = [
     ('H', 'H Start Index', 'H End Index'),
     ('C', 'C Start Index', 'C End Index'),
     ('W', 'W Start Index', 'W End Index'),
 ]
+
+# === Read input files ===
+print("🔄 Reading input files...")
+df_trip = pd.read_excel(TRIPLEX_FILE)
+df_meta = pd.read_excel(METADATA_FILE)
+
+df = df_trip.merge(df_meta[['ENST', 'display_name']], on='ENST', how='left')
+missing = df['ENST'].isna().sum()
+if missing > 0:
+    print(f"⚠️ Warning: {missing} triplex rows lack ENST metadata.")
+
+# Initialize output columns
 for prefix, _, _ in motifs:
     df[f"{prefix}_chrom"] = None
     df[f"{prefix}_genomic_start"] = None
     df[f"{prefix}_genomic_end"] = None
     df[f"{prefix}_strand"] = None
 
-SERVER = "https://rest.ensembl.org"
-HEADERS = {"Content-Type": "application/json"}
-session = requests.Session()
-session.headers.update(HEADERS)
+# === Step 1: Deduplicate unique motifs ===
+print("🔍 Deduplicating motifs...")
+unique_motifs = set()
+index_map = {}
+for idx, row in df.iterrows():
+    enst = row['ENST']
+    if pd.isna(enst): continue
+    for prefix, start_col, end_col in motifs:
+        start = row.get(start_col)
+        end   = row.get(end_col)
+        if pd.notna(start) and pd.notna(end):
+            key = (enst, int(start), int(end))
+            unique_motifs.add(key)
+            index_map.setdefault(key, []).append((idx, prefix))
 
-lock = threading.Lock()
-motif_cache = {}
-tasks = []
+# === Load or initialize cache ===
+print("🗄️ Loading cache...")
+if os.path.exists(CACHE_FILE):
+    with open(CACHE_FILE, 'r') as f:
+        cache = json.load(f)
+else:
+    cache = {}
 
-def map_motif(row_idx, enst, prefix, cdna_start, cdna_end):
-    motif_key = (enst, cdna_start, cdna_end)
-    with lock:
-        if motif_key in motif_cache:
-            mappings = motif_cache[motif_key]
-        else:
-            uri = f"/map/cdna/{enst}/{cdna_start}..{cdna_end}"
-            resp = session.get(SERVER + uri)
-            if not resp.ok:
-                print(f"❌ Error mapping {enst} {prefix} {cdna_start}-{cdna_end}: {resp.status_code}")
-                return
-            mappings = resp.json().get("mappings", [])
-            motif_cache[motif_key] = mappings
-    if not mappings:
-        print(f"⚠️ No mapping returned for {enst} {prefix} {cdna_start}-{cdna_end}")
-        return
+# Separate cached vs to-fetch
+print("↔️ Splitting cached vs to-fetch motifs...")
+cached_results = []
+to_fetch = []
+for key in unique_motifs:
+    enst, start, end = key
+    key_str = f"{enst}:{start}:{end}"
+    if key_str in cache:
+        cached_results.append((enst, start, end, cache[key_str]))
+    else:
+        to_fetch.append(key)
+print(f"✅ {len(cached_results)} cached; {len(to_fetch)} to fetch.")
 
-    block = mappings[0]
-    chrom  = block['seq_region_name']
-    gstart = block['start']
-    gend   = block['end']
-    strand = block['strand']
-    gstr   = '+' if strand == 1 else '-'
+# === Step 2: Async mapping with concurrency limit & backoff ===
+semaphore = asyncio.Semaphore(CONCURRENCY_LIMIT)
 
-    with lock:
-        df.at[row_idx, f"{prefix}_chrom"]          = f"chr{chrom}"
-        df.at[row_idx, f"{prefix}_genomic_start"] = gstart
-        df.at[row_idx, f"{prefix}_genomic_end"]   = gend
-        df.at[row_idx, f"{prefix}_strand"]        = gstr
-
-# === Parallel mapping ===
-overall_start = time.time()
-with ThreadPoolExecutor(max_workers=10) as executor:
-    for idx, row in df.iterrows():
-        enst = row['ENST']
-        if pd.isna(enst):
+async def async_map_motif(client, enst, start, end):
+    uri = f"/map/cdna/{enst}/{start}..{end}"
+    backoff = INITIAL_BACKOFF
+    for attempt in range(1, MAX_RETRIES + 1):
+        async with semaphore:
+            r = await client.get(SERVER + uri)
+        if r.status_code == 200:
+            return (enst, start, end, r.json().get("mappings", []))
+        if r.status_code == 429:
+            retry_after = int(r.headers.get("Retry-After", backoff))
+            print(f"⚠️ 429 rate-limit on {enst}:{start}-{end}; sleeping {retry_after}s (attempt {attempt})...")
+            await asyncio.sleep(retry_after)
+            backoff *= 2
             continue
-        for prefix, start_col, end_col in motifs:
-            cdna_start = row.get(start_col)
-            cdna_end   = row.get(end_col)
-            if pd.isna(cdna_start) or pd.isna(cdna_end):
-                continue
-            cdna_start = int(cdna_start)
-            cdna_end   = int(cdna_end)
-            tasks.append(executor.submit(map_motif, idx, enst, prefix, cdna_start, cdna_end))
+        print(f"❌ HTTP {r.status_code} for {enst}:{start}-{end}")
+        break
+    return (enst, start, end, [])
 
-    for i, future in enumerate(as_completed(tasks), start=1):
-        if i % 100 == 0:
-            elapsed = time.time() - overall_start
-            print(f"⏱ Completed {i} motif mappings in {elapsed:.1f}s")
+async def fetch_all(motif_list):
+    async with httpx.AsyncClient(headers=HEADERS, limits=httpx.Limits(max_connections=CONCURRENCY_LIMIT)) as client:
+        tasks = [async_map_motif(client, *key) for key in motif_list]
+        print(f"🚀 Launching {len(tasks)} tasks with concurrency={CONCURRENCY_LIMIT}...")
+        return await asyncio.gather(*tasks)
 
-# Save
-df.to_csv(OUTPUT_FILE, index=False)
-print(f"✅ Triplex-to-genome mapping saved to {OUTPUT_FILE} ({len(df)} rows) | Total time: {time.time() - overall_start:.1f}s")
+# Fetch missing motifs
+fetched_results = []
+if to_fetch:
+    start = time.time()
+    fetched_results = asyncio.run(fetch_all(to_fetch))
+    print(f"⏱ Fetched {len(fetched_results)} in {time.time()-start:.1f}s")
+
+# Update cache
+def save_cache():
+    with open(CACHE_FILE, 'w') as f:
+        json.dump(cache, f, indent=2)
+for enst, start, end, mappings in fetched_results:
+    cache[f"{enst}:{start}:{end}"] = mappings
+save_cache()
+
+# === Step 3: Apply mappings ===
+print("📝 Applying mappings to DataFrame...")
+all_results = cached_results + fetched_results
+for enst, start, end, mappings in all_results:
+    if not mappings: continue
+    block = mappings[0]
+    chrom = f"chr{block['seq_region_name']}"
+    gstart, gend = block['start'], block['end']
+    strand = '+' if block['strand']==1 else '-'
+    for idx, prefix in index_map[(enst, start, end)]:
+        df.at[idx, f"{prefix}_chrom"] = chrom
+        df.at[idx, f"{prefix}_genomic_start"] = gstart
+        df.at[idx, f"{prefix}_genomic_end"] = gend
+        df.at[idx, f"{prefix}_strand"] = strand
+
+# === Save output ===
+print("💾 Saving results...")
+df.to_excel(OUTPUT_FILE, index=False)
+print(f"✅ Done. Output -> {OUTPUT_FILE}")

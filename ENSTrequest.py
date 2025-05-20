@@ -66,7 +66,7 @@ df_out = pd.DataFrame({
 })
 
 # Write to Excel
-output_file = r"C:\Users\caleb\OneDrive\Brown\ProjectG\lncRNA_transcript_lookup.xlsx"
+output_file = r"C:\Users\caleb\OneDrive\Brown\ProjectG\nogap_lncRNA_transcript_lookup.xlsx"
 df_out.to_excel(output_file, index=False)
 
 print(f"✅ Saved {len(df_out)} records to {output_file}")
