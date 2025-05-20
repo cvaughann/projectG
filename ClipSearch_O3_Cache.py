@@ -2,6 +2,11 @@ import pandas as pd
 import time
 from collections import Counter
 time_start = time.time()
+### Make user confirm files are closed before running
+user_answer = input("Please confirm that the Excel file is closed before running this script (y/n): ")
+if user_answer.lower() != 'y':
+    print("Please close the Excel file and run the script again.")
+    exit()
 def query_data_cached(hdf5_fp, key, cache):
     """
     For the given gene key, load (or retrieve from cache) the HDF5 data corresponding to 
@@ -18,31 +23,41 @@ def query_data_cached(hdf5_fp, key, cache):
     df_subset = cache[group_key]
     
     # Determine overlap: intervals overlap if (df_subset.Start <= key.Stop) and (df_subset.Stop >= key.Start)
-    overlap_condition = (df_subset['Start'] <= key["Stop"]) & (df_subset['Stop'] >= key["Start"])
+    overlap_condition = (
+        ((df_subset['Start'] <= key["Hstart"]) & (df_subset['Stop'] >= key["Hstart"])) |
+        ((df_subset['Start'] <= key["Wstart"]) & (df_subset['Stop'] >= key["Wstart"])) |
+        ((df_subset['Start'] <= key["Cstart"]) & (df_subset['Stop'] >= key["Cstart"]))
+    )    
+    # overlap_conditionW = (df_subset['Start'] <= key["Wstart"]) & (df_subset['Stop'] >= key["Wstart"])
+    # overlap_conditionC = (df_subset['Start'] <= key["Cstart"]) & (df_subset['Stop'] >= key["Cstart"])
     df_overlap = df_subset[overlap_condition]
     
     return Counter(df_overlap['Protein'])
 
 # File paths
-excel_fp = r"C:\Users\caleb\OneDrive\Brown\ProjectG\Good Excel Files for CLIP comparison\lnc_data_complete_no_gap2.xlsx"
+excel_fp = r"C:\Users\caleb\OneDrive\Brown\ProjectG\gap_triplex_genomic_mappings.xlsx"
 hdf5_fp = r"C:\Users\caleb\OneDrive\Brown\ProjectG\HumanClipDB\human.h5"
 
-# Read the Excel file, which we expect to have columns: 'ENSG', 'Chromosome', 'Start', 'End', 'Strand2'.
+# Read the Excel file, which we expect to have columns: 'ENST', 'Chromosome', 'H_genomic_start', 'H-genomic_end', 'C_genomic_start', 'C-genomic_end','W_genomic_start', 'W-genomic_end','Strand'.
 df = pd.read_excel(excel_fp)
-
+'''
 # Adjust the Chromosome column to include the 'chr' prefix if missing.
 df['Chromosome'] = df['Chromosome'].astype(str).apply(lambda x: x if x.lower().startswith('chr') else "chr" + x)
-
+'''
 # Build a dictionary of gene keys.
 gene_dict = {}
 
 for idx, row in df.iterrows():
-    gene_dict[row["ENSG"]] = {
-        "ENSG": row["ENSG"],
+    gene_dict[row["ENST"]] = {
+        "ENST": row["ENST"],
         "Chromosome": row["Chromosome"],
-        "Start": row["Start"],
-        "Stop": row["End"],      # Map 'End' in Excel to 'Stop'
-        "Strand": row["Strand2"]   # Map 'Strand2' (Excel) to 'Strand'
+        "Hstart": row["H_genomic_start"],  # Map 'H Start Index' in Excel to 'Start'
+        "Cstart": row["C_genomic_start"],  # Map 'C Start Index' in Excel to 'Start'    
+        "Wstart": row["W_genomic_start"],  # Map 'W Start Index' in Excel to 'Start'
+        "Hstop": row["H_genomic_end"],      # Map 'End' in Excel to 'Stop'
+        "Cstop": row["C_genomic_end"],      # Map 'End' in Excel to 'Stop'
+        "Wstop": row["W_genomic_end"],      # Map 'End' in Excel to 'Stop'
+        "Strand": row["Strand"]   # Map 'Strand' (Excel) to 'Strand'
     }
 
 # print("Gene dictionary for processing:")
